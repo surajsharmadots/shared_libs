@@ -3,7 +3,7 @@ Database connection management with environment-based configuration
 """
 import os
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional
 from urllib.parse import urlparse, parse_qs, urlencode
 
 from sqlalchemy import create_engine, MetaData, text
