@@ -1,0 +1,26 @@
+# packages/core_postgres_db/pyproject.toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "core-postgres-db"
+version = "0.1.0"
+description = "Shared PostgreSQL database utilities"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Suraj Sharma", email = "spsurajsharma1723@gmail.com" }
+]
+
+dependencies = [
+  "SQLAlchemy>=2.0",
+  "asyncpg>=0.28",
+  "psycopg2-binary>=2.9",
+  "pydantic>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core_postgres_db"]

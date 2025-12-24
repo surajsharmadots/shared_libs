@@ -1,14 +1,17 @@
+# packages/core_postgres_db/core_postgres_db/query_builder.py
 """
-Advanced query building utilities
+Advanced query building utilities - Sonarqube compliant
 """
-from typing import Any, Dict, List, Optional, Tuple, Union
-from sqlalchemy import Table, select, and_, or_, not_, desc, asc, func
+from typing import Any, Dict, List, Optional, Tuple
+from sqlalchemy import Table, select, desc, asc, func
 from sqlalchemy.sql import Select
 
 from .utils import build_where_clause
+from .constants import MAX_QUERY_LIMIT
+
 
 class QueryBuilder:
-    """Builds complex SQL queries"""
+    """Builds complex SQL queries with validation"""
     
     @staticmethod
     def build_select_query(
@@ -39,9 +42,16 @@ class QueryBuilder:
         Returns:
             SQLAlchemy Select statement
         """
+        # Validate inputs
+        QueryBuilder._validate_select_params(
+            limit=limit, offset=offset, columns=columns
+        )
+        
         # Select columns
         if columns:
             cols = [table.c[col] for col in columns if col in table.c]
+            if not cols:
+                raise ValueError(f"No valid columns found in table {table.name}")
         else:
             cols = [table]
         
@@ -59,15 +69,17 @@ class QueryBuilder:
         
         # Add JOINs
         if join_tables:
-            for join_config in join_tables:
-                stmt = QueryBuilder._add_join(stmt, table, join_config)
+            stmt = QueryBuilder._add_joins(stmt, table, join_tables)
         
         # Add ORDER BY
         if order_by:
+            order_clauses = []
             for col_name, ascending in order_by:
                 if col_name in table.c:
                     col = table.c[col_name]
-                    stmt = stmt.order_by(asc(col) if ascending else desc(col))
+                    order_clauses.append(asc(col) if ascending else desc(col))
+            if order_clauses:
+                stmt = stmt.order_by(*order_clauses)
         
         # Add LIMIT and OFFSET
         if limit is not None:
@@ -78,24 +90,6 @@ class QueryBuilder:
         # Add FOR UPDATE if needed
         if for_update:
             stmt = stmt.with_for_update()
-        
-        return stmt
-    
-    @staticmethod
-    def _add_join(stmt: Select, base_table: Table, join_config: Dict[str, Any]) -> Select:
-        """Add JOIN clause to query"""
-        join_type = join_config.get("type", "inner").lower()
-        join_table = join_config["table"]
-        on_clause = join_config.get("on")
-        
-        if join_type == "left":
-            stmt = stmt.join(join_table, on_clause, isouter=True)
-        elif join_type == "right":
-            stmt = stmt.join(join_table, on_clause, isouter=True, full=False)
-        elif join_type == "full":
-            stmt = stmt.join(join_table, on_clause, isouter=True, full=True)
-        else:  # inner
-            stmt = stmt.join(join_table, on_clause)
         
         return stmt
     
@@ -122,7 +116,7 @@ class QueryBuilder:
         Returns:
             SQLAlchemy Select statement
         """
-        # Get aggregate function
+        # Validate aggregate function
         func_map = {
             "sum": func.sum,
             "count": func.count,
@@ -132,7 +126,10 @@ class QueryBuilder:
         }
         
         if aggregate_func not in func_map:
-            raise ValueError(f"Unsupported aggregate function: {aggregate_func}")
+            raise ValueError(
+                f"Unsupported aggregate function: {aggregate_func}. "
+                f"Supported: {list(func_map.keys())}"
+            )
         
         agg_func = func_map[aggregate_func]
         
@@ -143,6 +140,8 @@ class QueryBuilder:
         if aggregate_column == "*":
             agg_expr = agg_func()
         else:
+            if aggregate_column not in table.c:
+                raise ValueError(f"Column '{aggregate_column}' not found in table")
             agg_expr = agg_func(table.c[aggregate_column])
         
         select_cols.append(agg_expr.label(f"{aggregate_func}_{aggregate_column}"))
@@ -175,3 +174,60 @@ class QueryBuilder:
                 stmt = stmt.having(*having_clauses)
         
         return stmt
+    
+    @staticmethod
+    def _validate_select_params(
+        limit: Optional[int],
+        offset: int,
+        columns: Optional[List[str]]
+    ) -> None:
+        """Validate SELECT query parameters"""
+        if limit is not None:
+            if limit <= 0:
+                raise ValueError("Limit must be positive")
+            if limit > MAX_QUERY_LIMIT:
+                raise ValueError(f"Limit cannot exceed {MAX_QUERY_LIMIT}")
+        
+        if offset < 0:
+            raise ValueError("Offset cannot be negative")
+        
+        if columns and not isinstance(columns, list):
+            raise ValueError("Columns must be a list")
+    
+    @staticmethod
+    def _add_joins(stmt: Select, base_table: Table, join_configs: List[Dict[str, Any]]) -> Select:
+        """Add JOIN clauses to query"""
+        for join_config in join_configs:
+            stmt = QueryBuilder._add_join(stmt, base_table, join_config)
+        return stmt
+    
+    @staticmethod
+    def _add_join(stmt: Select, base_table: Table, join_config: Dict[str, Any]) -> Select:
+        """Add a single JOIN clause"""
+        # Validate join config
+        required_keys = ["table", "on"]
+        for key in required_keys:
+            if key not in join_config:
+                raise ValueError(f"Join config missing required key: {key}")
+        
+        join_table = join_config["table"]
+        on_clause = join_config["on"]
+        join_type = join_config.get("type", "inner").lower()
+        
+        # Validate join type
+        valid_join_types = ["inner", "left", "right", "full"]
+        if join_type not in valid_join_types:
+            raise ValueError(
+                f"Invalid join type: {join_type}. "
+                f"Valid options: {valid_join_types}"
+            )
+        
+        # Apply join
+        if join_type == "left":
+            return stmt.join(join_table, on_clause, isouter=True)
+        elif join_type == "right":
+            return stmt.join(join_table, on_clause, isouter=True, full=False)
+        elif join_type == "full":
+            return stmt.join(join_table, on_clause, isouter=True, full=True)
+        else:  # inner
+            return stmt.join(join_table, on_clause)

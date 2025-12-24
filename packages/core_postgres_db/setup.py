@@ -1,5 +1,5 @@
+# shared_libs/packages/core_postgres_db/setup.py
 from setuptools import setup, find_packages
-import os
 
 # README read karna
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -29,11 +29,9 @@ setup(
     # Dependencies
     install_requires=[
         'SQLAlchemy>=2.0.0',
-        'tenacity>=8.2.0',
         'psycopg2-binary>=2.9.0',
         'asyncpg>=0.28.0',
         'pydantic>=2.0.0',
-        'pydantic-settings>=2.0.0',
         'python-dotenv>=1.0.0',  # MUST for .env support
     ],
     

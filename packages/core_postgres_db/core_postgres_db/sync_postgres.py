@@ -1,46 +1,44 @@
+# packages/core_postgres_db/core_postgres_db/sync_postgres.py
 """
-Synchronous CRUD operations with atomic transactions
+Synchronous PostgreSQL client for legacy systems - Sonarqube compliant
 """
-import time
 import logging
+import time
 from typing import Any, Dict, List, Optional, Union
 from contextlib import contextmanager
-from datetime import datetime
 
-from sqlalchemy import Table, insert, select, update, delete, text, func
-from sqlalchemy.engine import Engine, Result
+from sqlalchemy import insert, select, update, delete, text, func, create_engine
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from sqlalchemy.sql import Select
 
-from .connection import ConnectionManager
-from .types import DatabaseConfig, QueryOptions, BulkInsertOptions, UpdateOptions
-from .exceptions import (
-    DatabaseError, DuplicateEntryError, ConstraintViolationError,
-    RecordNotFoundError, TimeoutError, TransactionError
+from .base_crud import BaseDatabaseClient
+from .base_operations import BaseDatabaseOperations
+from .config import DatabaseConfig, get_database_config
+from .constants import (
+    DEFAULT_TIMEOUT_SECONDS, BULK_OPERATION_TIMEOUT, MAX_DEADLOCK_RETRIES,
+    READ_COMMITTED
 )
-from .performance_monitor import QueryStats, QueryMetrics
-from .utils import (
-    safe_table_ref, rows_to_dicts, validate_table_name,
-    build_where_clause, paginate_query, extract_returning_columns
+from .exceptions import (
+    DatabaseError,TransactionError
+)
+from .types import (
+    QueryOptions, BulkInsertOptions, UpdateOptions,
+    PaginatedResult
 )
 from .decorators import retry_on_deadlock, timeout, log_query_execution
 from .query_builder import QueryBuilder
 from .transactions import TransactionManager
-from .connection import get_database_config
+from .utils import rows_to_dicts, build_where_clause, chunk_list
 
 logger = logging.getLogger(__name__)
 
-class SyncPostgresDB:
+
+class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
     """
-    Synchronous PostgreSQL operations with full atomic support
+    Synchronous PostgreSQL client for legacy systems
     
-    Features:
-    - All writes are atomic by default
-    - Connection pooling
-    - Automatic retry on deadlocks
-    - Query timeouts
-    - Comprehensive error handling
-    - Environment-based configuration
+    Note: For e-commerce microservices, prefer AsyncPostgresDB
+    This is provided for compatibility with sync codebases
     """
     
     def __init__(
@@ -50,13 +48,14 @@ class SyncPostgresDB:
         **kwargs
     ):
         """
-        Initialize database connection
+        Initialize sync database connection
         
         Args:
-            connection_string: PostgreSQL connection string (optional)
-            config: DatabaseConfig object (optional)
-            **kwargs: Database configuration parameters
+            connection_string: PostgreSQL connection string
+            config: Pre-configured DatabaseConfig object
+            **kwargs: Configuration overrides
         """
+        # Get configuration
         if config:
             self.config = config
         else:
@@ -65,58 +64,34 @@ class SyncPostgresDB:
                 **kwargs
             )
         
-        self.connection_manager = ConnectionManager(self.config)
-        self.engine: Engine = self.connection_manager.get_sync_engine()
-        self.metadata = self.connection_manager.metadata
+        # Create sync engine
+        self.engine: Engine = create_engine(
+            self.config.connection_string,
+            pool_size=self.config.pool_size,
+            max_overflow=self.config.max_overflow,
+            pool_timeout=self.config.pool_timeout,
+            pool_recycle=self.config.pool_recycle,
+            echo=self.config.echo,
+            pool_pre_ping=True,
+        )
         
-        # Cache for table metadata
-        self._table_cache: Dict[str, Table] = {}
-        self._query_stats = QueryStats()
+        # Initialize metadata
+        from sqlalchemy import MetaData
+        self.metadata = MetaData(schema=self.config.schema)
+        
+        # Initialize base operations
+        BaseDatabaseOperations.__init__(self, self.config, self.engine, self.metadata)
+        
+        # Initialize components
         self._query_builder = QueryBuilder()
         self._transaction_manager = TransactionManager(self.engine)
         
         logger.info(f"SyncPostgresDB initialized for schema: {self.config.schema}")
     
-    # ==================== TABLE MANAGEMENT ====================
-    
-    def _get_table(self, table_name: str) -> Table:
-        """Get table with caching and schema support"""
-        safe_name = safe_table_ref(table_name)
-        
-        if safe_name not in self._table_cache:
-            table = Table(
-                safe_name,
-                self.metadata,
-                autoload_with=self.engine,
-                schema=self.config.schema,
-                extend_existing=True
-            )
-            self._table_cache[safe_name] = table
-        
-        return self._table_cache[safe_name]
-    
-    def get_table_info(self, table_name: str) -> Dict[str, Any]:
-        """Get table metadata information"""
-        table = self._get_table(table_name)
-        return {
-            "name": table.name,
-            "schema": table.schema,
-            "columns": [{"name": c.name, "type": str(c.type)} for c in table.columns],
-            "primary_key": [c.name for c in table.primary_key.columns],
-            "foreign_keys": [
-                {
-                    "constrained_columns": list(fk.constrained_columns),
-                    "referred_table": fk.referred_table.name,
-                    "referred_columns": list(fk.referred_columns)
-                }
-                for fk in table.foreign_keys
-            ]
-        }
-    
     # ==================== ATOMIC CREATE OPERATIONS ====================
     
-    @retry_on_deadlock(max_retries=3)
-    @timeout(seconds=30)
+    @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
+    @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     @log_query_execution
     def create(
         self,
@@ -125,7 +100,7 @@ class SyncPostgresDB:
         returning: bool = True
     ) -> Optional[Dict[str, Any]]:
         """
-        Atomic insert operation
+        Atomic sync insert operation
         
         Args:
             table_name: Target table
@@ -139,64 +114,45 @@ class SyncPostgresDB:
         table = self._get_table(table_name)
         
         try:
-            # Build INSERT statement
+            # Validate data
+            self._validate_data(data, "create")
+            
+            # Build and execute INSERT
             stmt = insert(table).values(**data)
             if returning:
                 stmt = stmt.returning(table)
             
-            # Execute with atomic transaction
             with self.engine.begin() as conn:
                 result = conn.execute(stmt)
                 
                 if returning:
                     row = result.fetchone()
-                    elapsed = time.time() - start_time
-                    self._query_stats.record_write(
-                        f"create:{table_name}",
-                        elapsed,
-                        1,
-                        "success"
+                    rows_affected = 1 if row else 0
+                    self._record_query_metrics(
+                        operation="create",
+                        table_name=table_name,
+                        start_time=start_time,
+                        rows_affected=rows_affected
                     )
                     return dict(row._mapping) if row else None
                 
-                elapsed = time.time() - start_time
-                self._query_stats.record_write(
-                    f"create:{table_name}",
-                    elapsed,
-                    1,
-                    "success"
+                self._record_query_metrics(
+                    operation="create",
+                    table_name=table_name,
+                    start_time=start_time,
+                    rows_affected=1
                 )
                 return None
                 
         except IntegrityError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_write(
-                f"create:{table_name}",
-                elapsed,
-                0,
-                "integrity_error",
-                str(e)
-            )
-            
-            if "duplicate key" in str(e).lower():
-                raise DuplicateEntryError(f"Duplicate entry for {table_name}: {e}")
-            raise ConstraintViolationError(f"Constraint violation in {table_name}: {e}")
-            
+            self._handle_integrity_error(e, "create", table_name)
         except SQLAlchemyError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_write(
-                f"create:{table_name}",
-                elapsed,
-                0,
-                "error",
-                str(e)
-            )
-            raise DatabaseError(f"Insert failed for {table_name}: {e}")
+            self._handle_database_error(e, "create", table_name)
     
     # ==================== ATOMIC BULK CREATE ====================
     
-    @retry_on_deadlock(max_retries=3)
-    @timeout(seconds=120)
+    @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
+    @timeout(seconds=BULK_OPERATION_TIMEOUT)
     @log_query_execution
     def bulk_create(
         self,
@@ -205,12 +161,12 @@ class SyncPostgresDB:
         options: Optional[BulkInsertOptions] = None
     ) -> List[Dict[str, Any]]:
         """
-        Atomic bulk insert with batch processing
+        Atomic sync bulk insert with batch processing
         
         Args:
             table_name: Target table
             data_list: List of data dictionaries
-            options: Bulk insert options
+            options: Bulk insert configuration
             
         Returns:
             List of inserted rows
@@ -221,19 +177,17 @@ class SyncPostgresDB:
         opts = options or BulkInsertOptions()
         table = self._get_table(table_name)
         all_rows = []
-        total_rows = len(data_list)
         
         start_time = time.time()
         
         try:
-            # Execute in a single atomic transaction
+            # Execute in single atomic transaction
             with self.engine.begin() as conn:
-                for i in range(0, total_rows, opts.batch_size):
-                    batch = data_list[i:i + opts.batch_size]
-                    
+                # Process in batches
+                for batch in chunk_list(data_list, opts.batch_size):
                     stmt = insert(table).values(batch)
                     
-                    # Handle conflict resolution
+                    # Handle conflicts
                     if opts.on_conflict_do_nothing:
                         stmt = stmt.on_conflict_do_nothing()
                     elif opts.on_conflict_do_update:
@@ -249,43 +203,23 @@ class SyncPostgresDB:
                     else:
                         conn.execute(stmt)
                 
-                elapsed = time.time() - start_time
-                self._query_stats.record_write(
-                    f"bulk_create:{table_name}",
-                    elapsed,
-                    total_rows,
-                    "success"
+                # Record metrics
+                self._record_query_metrics(
+                    operation="bulk_create",
+                    table_name=table_name,
+                    start_time=start_time,
+                    rows_affected=len(data_list)
                 )
                 return all_rows
                 
         except IntegrityError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_write(
-                f"bulk_create:{table_name}",
-                elapsed,
-                0,
-                "integrity_error",
-                str(e)
-            )
-            
-            if "duplicate key" in str(e).lower():
-                raise DuplicateEntryError(f"Duplicate in bulk insert to {table_name}: {e}")
-            raise ConstraintViolationError(f"Constraint violation in bulk insert to {table_name}: {e}")
-            
+            self._handle_integrity_error(e, "bulk_create", table_name)
         except SQLAlchemyError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_write(
-                f"bulk_create:{table_name}",
-                elapsed,
-                0,
-                "error",
-                str(e)
-            )
-            raise DatabaseError(f"Bulk insert failed for {table_name}: {e}")
+            self._handle_database_error(e, "bulk_create", table_name)
     
     # ==================== READ OPERATIONS ====================
     
-    @timeout(seconds=30)
+    @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     @log_query_execution
     def read(
         self,
@@ -294,7 +228,7 @@ class SyncPostgresDB:
         options: Optional[QueryOptions] = None
     ) -> List[Dict[str, Any]]:
         """
-        Read records with filtering
+        Sync read records with filtering
         
         Args:
             table_name: Target table
@@ -307,8 +241,12 @@ class SyncPostgresDB:
         start_time = time.time()
         table = self._get_table(table_name)
         
+        # Validate conditions
+        if conditions:
+            self._validate_conditions(conditions)
+        
         try:
-            # Build query using query builder
+            # Build query
             stmt = self._query_builder.build_select_query(
                 table=table,
                 columns=options.columns if options else None,
@@ -320,34 +258,27 @@ class SyncPostgresDB:
                 for_update=options.for_update if options else False
             )
             
+            # Execute query
             with self.engine.connect() as conn:
                 result = conn.execute(stmt)
                 rows = rows_to_dicts(result)
                 
-                elapsed = time.time() - start_time
-                self._query_stats.record_read(
-                    f"read:{table_name}",
-                    elapsed,
-                    len(rows),
-                    "success"
+                # Record metrics
+                self._record_query_metrics(
+                    operation="read",
+                    table_name=table_name,
+                    start_time=start_time,
+                    rows_affected=len(rows)
                 )
                 return rows
                 
         except SQLAlchemyError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_read(
-                f"read:{table_name}",
-                elapsed,
-                0,
-                "error",
-                str(e)
-            )
-            raise DatabaseError(f"Read failed for {table_name}: {e}")
+            self._handle_database_error(e, "read", table_name)
     
     # ==================== ATOMIC UPDATE OPERATIONS ====================
     
-    @retry_on_deadlock(max_retries=3)
-    @timeout(seconds=30)
+    @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
+    @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     @log_query_execution
     def update(
         self,
@@ -357,13 +288,13 @@ class SyncPostgresDB:
         options: Optional[UpdateOptions] = None
     ) -> List[Dict[str, Any]]:
         """
-        Atomic update operation
+        Atomic sync update operation
         
         Args:
             table_name: Target table
             data: Data to update
             conditions: WHERE conditions
-            options: Update options
+            options: Update configuration
             
         Returns:
             List of updated rows
@@ -371,6 +302,10 @@ class SyncPostgresDB:
         start_time = time.time()
         table = self._get_table(table_name)
         opts = options or UpdateOptions()
+        
+        # Validate
+        self._validate_data(data, "update")
+        self._validate_conditions(conditions)
         
         try:
             # Build UPDATE statement
@@ -384,29 +319,27 @@ class SyncPostgresDB:
             if opts.returning:
                 stmt = stmt.returning(table)
             
-            # Execute with atomic transaction if specified
+            # Execute with appropriate context
             if opts.atomic:
                 with self.engine.begin() as conn:
                     result = conn.execute(stmt)
                     
                     if opts.returning:
                         rows = rows_to_dicts(result)
-                        elapsed = time.time() - start_time
-                        self._query_stats.record_write(
-                            f"update:{table_name}",
-                            elapsed,
-                            len(rows),
-                            "success"
+                        self._record_query_metrics(
+                            operation="update",
+                            table_name=table_name,
+                            start_time=start_time,
+                            rows_affected=len(rows)
                         )
                         return rows
                     else:
                         rowcount = result.rowcount
-                        elapsed = time.time() - start_time
-                        self._query_stats.record_write(
-                            f"update:{table_name}",
-                            elapsed,
-                            rowcount,
-                            "success"
+                        self._record_query_metrics(
+                            operation="update",
+                            table_name=table_name,
+                            start_time=start_time,
+                            rows_affected=rowcount
                         )
                         return []
             else:
@@ -415,51 +348,32 @@ class SyncPostgresDB:
                     
                     if opts.returning:
                         rows = rows_to_dicts(result)
-                        elapsed = time.time() - start_time
-                        self._query_stats.record_write(
-                            f"update:{table_name}",
-                            elapsed,
-                            len(rows),
-                            "success"
+                        self._record_query_metrics(
+                            operation="update",
+                            table_name=table_name,
+                            start_time=start_time,
+                            rows_affected=len(rows)
                         )
                         return rows
                     else:
                         rowcount = result.rowcount
-                        elapsed = time.time() - start_time
-                        self._query_stats.record_write(
-                            f"update:{table_name}",
-                            elapsed,
-                            rowcount,
-                            "success"
+                        self._record_query_metrics(
+                            operation="update",
+                            table_name=table_name,
+                            start_time=start_time,
+                            rows_affected=rowcount
                         )
                         return []
                 
         except IntegrityError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_write(
-                f"update:{table_name}",
-                elapsed,
-                0,
-                "integrity_error",
-                str(e)
-            )
-            raise ConstraintViolationError(f"Update constraint violation in {table_name}: {e}")
-            
+            self._handle_integrity_error(e, "update", table_name)
         except SQLAlchemyError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_write(
-                f"update:{table_name}",
-                elapsed,
-                0,
-                "error",
-                str(e)
-            )
-            raise DatabaseError(f"Update failed for {table_name}: {e}")
+            self._handle_database_error(e, "update", table_name)
     
     # ==================== ATOMIC DELETE OPERATIONS ====================
     
-    @retry_on_deadlock(max_retries=3)
-    @timeout(seconds=30)
+    @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
+    @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     @log_query_execution
     def delete(
         self,
@@ -468,7 +382,7 @@ class SyncPostgresDB:
         returning: bool = False
     ) -> Union[int, List[Dict[str, Any]]]:
         """
-        Atomic delete operation
+        Atomic sync delete operation
         
         Args:
             table_name: Target table
@@ -480,6 +394,8 @@ class SyncPostgresDB:
         """
         start_time = time.time()
         table = self._get_table(table_name)
+        
+        self._validate_conditions(conditions)
         
         try:
             # Build DELETE statement
@@ -499,39 +415,29 @@ class SyncPostgresDB:
                 
                 if returning:
                     rows = rows_to_dicts(result)
-                    elapsed = time.time() - start_time
-                    self._query_stats.record_write(
-                        f"delete:{table_name}",
-                        elapsed,
-                        len(rows),
-                        "success"
+                    self._record_query_metrics(
+                        operation="delete",
+                        table_name=table_name,
+                        start_time=start_time,
+                        rows_affected=len(rows)
                     )
                     return rows
                 else:
                     rowcount = result.rowcount
-                    elapsed = time.time() - start_time
-                    self._query_stats.record_write(
-                        f"delete:{table_name}",
-                        elapsed,
-                        rowcount,
-                        "success"
+                    self._record_query_metrics(
+                        operation="delete",
+                        table_name=table_name,
+                        start_time=start_time,
+                        rows_affected=rowcount
                     )
                     return rowcount
                 
         except SQLAlchemyError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_write(
-                f"delete:{table_name}",
-                elapsed,
-                0,
-                "error",
-                str(e)
-            )
-            raise DatabaseError(f"Delete failed for {table_name}: {e}")
+            self._handle_database_error(e, "delete", table_name)
     
-    # ==================== ADVANCED QUERIES ====================
+    # ==================== QUERY METHODS ====================
     
-    @timeout(seconds=30)
+    @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     def read_one(
         self,
         table_name: str,
@@ -542,12 +448,12 @@ class SyncPostgresDB:
         results = self.read(table_name, conditions, options)
         return results[0] if results else None
     
-    @timeout(seconds=30)
+    @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     def read_by_id(self, table_name: str, record_id: Any) -> Optional[Dict[str, Any]]:
         """Read record by ID"""
         return self.read_one(table_name, {"id": record_id})
     
-    @timeout(seconds=30)
+    @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     def exists(self, table_name: str, conditions: Dict[str, Any]) -> bool:
         """Check if record exists"""
         table = self._get_table(table_name)
@@ -565,7 +471,7 @@ class SyncPostgresDB:
         except SQLAlchemyError as e:
             raise DatabaseError(f"Exists check failed for {table_name}: {e}")
     
-    @timeout(seconds=30)
+    @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     def count(self, table_name: str, conditions: Optional[Dict[str, Any]] = None) -> int:
         """Count records"""
         table = self._get_table(table_name)
@@ -583,9 +489,55 @@ class SyncPostgresDB:
         except SQLAlchemyError as e:
             raise DatabaseError(f"Count failed for {table_name}: {e}")
     
+    def paginate(
+        self,
+        table_name: str,
+        conditions: Optional[Dict[str, Any]] = None,
+        page: int = 1,
+        per_page: int = 20,
+        order_by: Optional[List[tuple]] = None
+    ) -> PaginatedResult:
+        """
+        Paginate records
+        
+        Args:
+            table_name: Target table
+            conditions: Filter conditions
+            page: Page number (1-indexed)
+            per_page: Items per page
+            order_by: Sorting criteria
+            
+        Returns:
+            Paginated result with metadata
+        """
+        # Get total count
+        total = self.count(table_name, conditions)
+        
+        # Calculate pagination
+        total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+        page = max(1, min(page, total_pages))
+        
+        # Build query options
+        options = QueryOptions(
+            limit=per_page,
+            offset=(page - 1) * per_page,
+            order_by=order_by
+        )
+        
+        # Get items
+        items = self.read(table_name, conditions, options)
+        
+        return PaginatedResult(
+            items=items,
+            total=total,
+            page=page,
+            per_page=per_page,
+            total_pages=total_pages
+        )
+    
     # ==================== RAW SQL WITH ATOMIC SUPPORT ====================
     
-    @timeout(seconds=60)
+    @timeout(seconds=BULK_OPERATION_TIMEOUT)
     @log_query_execution
     def execute_raw_sql(
         self,
@@ -622,24 +574,20 @@ class SyncPostgresDB:
                     
                     if fetch_results and result.returns_rows:
                         rows = rows_to_dicts(result)
-                        elapsed = time.time() - start_time
-                        self._query_stats.record_raw_sql(
-                            "raw_sql",
-                            elapsed,
-                            len(rows),
-                            "success" if is_write else "read",
-                            sql_lower[:50]
+                        self._record_query_metrics(
+                            operation="raw_sql_write",
+                            table_name="raw_sql",
+                            start_time=start_time,
+                            rows_affected=len(rows)
                         )
                         return rows
                     else:
                         rowcount = result.rowcount
-                        elapsed = time.time() - start_time
-                        self._query_stats.record_raw_sql(
-                            "raw_sql",
-                            elapsed,
-                            rowcount,
-                            "write",
-                            sql_lower[:50]
+                        self._record_query_metrics(
+                            operation="raw_sql_write",
+                            table_name="raw_sql",
+                            start_time=start_time,
+                            rows_affected=rowcount
                         )
                         return rowcount
             else:
@@ -648,50 +596,37 @@ class SyncPostgresDB:
                     
                     if fetch_results and result.returns_rows:
                         rows = rows_to_dicts(result)
-                        elapsed = time.time() - start_time
-                        self._query_stats.record_raw_sql(
-                            "raw_sql",
-                            elapsed,
-                            len(rows),
-                            "read",
-                            sql_lower[:50]
+                        self._record_query_metrics(
+                            operation="raw_sql_read",
+                            table_name="raw_sql",
+                            start_time=start_time,
+                            rows_affected=len(rows)
                         )
                         return rows
                     else:
                         rowcount = result.rowcount
-                        elapsed = time.time() - start_time
-                        self._query_stats.record_raw_sql(
-                            "raw_sql",
-                            elapsed,
-                            rowcount,
-                            "write",
-                            sql_lower[:50]
+                        self._record_query_metrics(
+                            operation="raw_sql_write",
+                            table_name="raw_sql",
+                            start_time=start_time,
+                            rows_affected=rowcount
                         )
                         return rowcount
                     
         except SQLAlchemyError as e:
-            elapsed = time.time() - start_time
-            self._query_stats.record_raw_sql(
-                "raw_sql",
-                elapsed,
-                0,
-                "error",
-                sql_lower[:50],
-                str(e)
-            )
-            raise DatabaseError(f"Raw SQL execution failed: {e}")
+            self._handle_database_error(e, "raw_sql", "raw_sql")
     
     # ==================== TRANSACTION MANAGEMENT ====================
     
     @contextmanager
-    def transaction(self, isolation_level: str = "READ COMMITTED"):
+    def transaction(self, isolation_level: str = READ_COMMITTED):
         """
         Context manager for database transactions
         
         Usage:
-            with db.transaction() as tx:
-                db.create("users", {...})
-                db.update("profiles", {...}, {...})
+            with db.transaction():
+                db.create("users", user_data)
+                db.update("profiles", profile_data, conditions)
         """
         with self._transaction_manager.begin(isolation_level=isolation_level) as conn:
             try:
@@ -700,15 +635,39 @@ class SyncPostgresDB:
                 logger.error(f"Transaction failed: {e}")
                 raise TransactionError(f"Transaction failed: {e}")
     
-    def begin_transaction(self, isolation_level: str = "READ COMMITTED"):
-        """Begin a new transaction"""
-        return self._transaction_manager.begin(isolation_level=isolation_level)
+    # ==================== ASYNC METHODS (NOT IMPLEMENTED) ====================
+    
+    async def acreate(self, *args, **kwargs):
+        """Async create (not available in sync client)"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
+    
+    async def aread(self, *args, **kwargs):
+        """Async read (not available in sync client)"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
+    
+    async def aupdate(self, *args, **kwargs):
+        """Async update (not available in sync client)"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
+    
+    async def adelete(self, *args, **kwargs):
+        """Async delete (not available in sync client)"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
+    
+    async def atransaction(self, *args, **kwargs):
+        """Async transaction (not available in sync client)"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
     
     # ==================== UTILITIES ====================
     
     def health_check(self) -> bool:
         """Check database health"""
-        return self.connection_manager.health_check()
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text("SELECT 1"))
+                return result.scalar() == 1
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return False
     
     def get_stats(self) -> Dict[str, Any]:
         """Get database statistics"""
@@ -721,7 +680,7 @@ class SyncPostgresDB:
                 "checked_out": pool.checkedout(),
                 "overflow": pool.overflow(),
             },
-            "query_stats": self._query_stats.snapshot(),
+            "query_stats": self.get_query_stats(),
             "schema": self.config.schema,
             "tables_cached": len(self._table_cache),
             "config": {
@@ -732,11 +691,7 @@ class SyncPostgresDB:
             }
         }
     
-    def clear_cache(self):
-        """Clear table cache"""
-        self._table_cache.clear()
-    
     def close(self):
         """Close database connection"""
-        self.connection_manager.dispose()
-        logger.info("Database connection closed")
+        self.engine.dispose()
+        logger.info("Sync database connection closed")

@@ -1,0 +1,28 @@
+
+Empty README =  
+> “I ship code but don’t explain it. Good luck.”
+
+---
+
+## 3️⃣ `LICENSE` — **CRITICALLY IMPORTANT (legally)**
+
+This is the only file lawyers care about.  
+And yes, lawyers can hurt you.
+
+### What it does
+- Defines **who can use your code**
+- Determines if companies can legally depend on it
+- Without it → **code is legally unusable**
+
+If this is blank, your code is **“all rights reserved” by default**.
+
+### Use MIT (don’t get creative)
+
+```text
+MIT License
+
+Copyright (c) 2025 Suraj Sharma
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction...
