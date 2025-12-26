@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional, Union
 from contextlib import contextmanager
 
-from sqlalchemy import insert, select, update, delete, text, func, create_engine
+from sqlalchemy import  insert, select, update, delete, text, func, create_engine, MetaData
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
@@ -76,7 +76,6 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         )
         
         # Initialize metadata
-        from sqlalchemy import MetaData
         self.metadata = MetaData(schema=self.config.schema)
         
         # Initialize base operations

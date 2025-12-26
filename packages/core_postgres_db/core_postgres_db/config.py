@@ -5,7 +5,7 @@ Database configuration management - Sonarqube compliant
 import os
 import logging
 from typing import Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs, urlencode
 
 from .constants import (
