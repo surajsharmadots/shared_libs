@@ -794,3 +794,154 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         )
         
         return result if isinstance(result, int) else 0
+    
+    # ==================== ABSTRACT METHODS IMPLEMENTATION ====================
+    # These methods are required by AsyncBaseDatabaseClient abstract class
+    
+    async def bulk_create(
+        self,
+        table_name: str,
+        data_list: List[Dict[str, Any]],
+        options: Optional[BulkInsertOptions] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Sync interface for bulk create - required by abstract class
+        """
+        return await self.abulk_create(table_name, data_list, options)
+    
+    async def count(
+        self,
+        table_name: str,
+        conditions: Optional[Dict[str, Any]] = None
+    ) -> int:
+        """
+        Sync interface for count - required by abstract class
+        """
+        return await self.acount(table_name, conditions)
+    
+    async def execute_raw_sql(
+        self,
+        sql_query: str,
+        parameters: Optional[Dict[str, Any]] = None,
+        fetch_results: bool = True
+    ) -> Union[List[Dict[str, Any]], int, None]:
+        """
+        Sync interface for raw SQL - required by abstract class
+        """
+        return await self.aexecute_raw_sql(
+            sql_query=sql_query,
+            parameters=parameters,
+            fetch_results=fetch_results,
+            atomic=False
+        )
+    
+    async def exists(
+        self,
+        table_name: str,
+        conditions: Dict[str, Any]
+    ) -> bool:
+        """
+        Sync interface for exists check - required by abstract class
+        """
+        return await self.aexists(table_name, conditions)
+    
+    async def paginate(
+        self,
+        table_name: str,
+        conditions: Optional[Dict[str, Any]] = None,
+        page: int = 1,
+        per_page: int = 20,
+        order_by: Optional[List[tuple]] = None
+    ) -> PaginatedResult:
+        """
+        Sync interface for pagination - required by abstract class
+        """
+        return await self.apaginate(
+            table_name=table_name,
+            conditions=conditions,
+            page=page,
+            per_page=per_page,
+            order_by=order_by
+        )
+    
+    async def read_by_id(
+        self,
+        table_name: str,
+        record_id: Any
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Sync interface for read by ID - required by abstract class
+        """
+        return await self.aread_by_id(table_name, record_id)
+    
+    async def read_one(
+        self,
+        table_name: str,
+        conditions: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Sync interface for read one - required by abstract class
+        """
+        return await self.aread_one(table_name, conditions)
+    
+    @asynccontextmanager
+    async def transaction(self, isolation_level: str = "READ COMMITTED"):
+        """
+        Sync interface for transaction - required by abstract class
+        
+        Note: This wraps the async atransaction method
+        """
+        async with self.atransaction(isolation_level=isolation_level) as conn:
+            yield conn
+    
+    # ==================== OTHER ABSTRACT METHODS ====================
+    
+    async def create(
+        self,
+        table_name: str,
+        data: Dict[str, Any],
+        returning: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Sync interface for create - required by abstract class
+        """
+        return await self.acreate(table_name, data, returning)
+    
+    async def read(
+        self,
+        table_name: str,
+        conditions: Optional[Dict[str, Any]] = None,
+        options: Optional[QueryOptions] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Sync interface for read - required by abstract class
+        """
+        return await self.aread(table_name, conditions, options)
+    
+    async def update(
+        self,
+        table_name: str,
+        data: Dict[str, Any],
+        conditions: Dict[str, Any],
+        returning: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Sync interface for update - required by abstract class
+        """
+        return await self.aupdate(
+            table_name,
+            data,
+            conditions,
+            UpdateOptions(returning=returning, atomic=True)
+        )
+    
+    async def delete(
+        self,
+        table_name: str,
+        conditions: Dict[str, Any]
+    ) -> int:
+        """
+        Sync interface for delete - required by abstract class
+        """
+        result = await self.adelete(table_name, conditions, returning=False)
+        return result if isinstance(result, int) else len(result)
