@@ -260,6 +260,12 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         
         try:
             # Build query
+            # Convert dict to QueryOptions if needed
+            if options is not None and isinstance(options, dict):
+                options = QueryOptions(**options)
+            elif options is None:
+                options = QueryOptions()
+                
             stmt = self._query_builder.build_select_query(
                 table=table,
                 columns=options.columns if options else None,
@@ -315,7 +321,10 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         """
         start_time = time.time()
         table = self._get_table(table_name)
-        opts = options or UpdateOptions()
+        if options is not None and isinstance(options, dict):
+            opts = UpdateOptions(**options)
+        elif options is None:
+            opts = UpdateOptions()
         
         # Validate
         self._validate_data(data, "update")
@@ -329,7 +338,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
             where_clauses = build_where_clause(table, conditions)
             if where_clauses:
                 stmt = stmt.where(*where_clauses)
-            
+
             if opts.returning:
                 stmt = stmt.returning(table)
             
