@@ -1,4 +1,4 @@
-# packages/core_postgres_db/core_postgres_db/__init__.py
+# packages/core_postgres_db/__init__.py
 """
 Core PostgreSQL Database Module
 
@@ -16,12 +16,62 @@ from .utils import rows_to_dicts, build_where_clause
 from .query_builder import QueryBuilder
 from .performance_monitor import QueryStats
 
+# Factory function for creating database clients
+def create_database_client(
+    connection_string: str = None,
+    config: DatabaseConfig = None,
+    use_async: bool = True,
+    **kwargs
+):
+    """
+    Factory function to create database client
+    
+    Args:
+        connection_string: PostgreSQL connection string
+        config: Pre-configured DatabaseConfig object
+        use_async: Whether to create async client (default: True)
+        **kwargs: Additional configuration parameters
+    
+    Returns:
+        AsyncPostgresDB or SyncPostgresDB instance
+    
+    Examples:
+        # Async client (recommended for FastAPI)
+        db = create_database_client(use_async=True)
+        
+        # With connection string
+        db = create_database_client(
+            connection_string="postgresql://user:pass@localhost/db",
+            use_async=True
+        )
+        
+        # Sync client (for legacy code)
+        db = create_database_client(use_async=False)
+        
+        # With configuration object
+        config = DatabaseConfig(...)
+        db = create_database_client(config=config)
+    """
+    if use_async:
+        return AsyncPostgresDB(
+            connection_string=connection_string,
+            config=config,
+            **kwargs
+        )
+    else:
+        return SyncPostgresDB(
+            connection_string=connection_string,
+            config=config,
+            **kwargs
+        )
+
 __all__ = [
     # Main classes
     "AsyncPostgresDB",
     "SyncPostgresDB",
     "DatabaseConfig",
     "get_database_config",
+    "create_database_client", 
     
     # Exceptions
     "DatabaseError",
