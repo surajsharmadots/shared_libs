@@ -1,6 +1,6 @@
 # packages/core_postgres_db/core_postgres_db/async_postgres.py
 """
-Async PostgreSQL client for e-commerce microservices - Sonarqube compliant
+Async PostgreSQL client - uses AsyncDatabaseOperations
 """
 import asyncio
 import logging
@@ -11,22 +11,17 @@ from contextlib import asynccontextmanager
 from sqlalchemy import insert, select, update, delete, text, func
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from sqlalchemy import MetaData, create_engine
+from sqlalchemy import MetaData
 
 from .base_crud import AsyncBaseDatabaseClient
-from .base_operations import BaseDatabaseOperations
+from .async_operations import AsyncDatabaseOperations 
 from .config import DatabaseConfig, get_database_config
 from .constants import (
     DEFAULT_TIMEOUT_SECONDS, BULK_OPERATION_TIMEOUT, MAX_DEADLOCK_RETRIES,
     READ_COMMITTED
 )
-from .exceptions import (
-    DatabaseError,
-    TransactionError
-)
-from .types import (
-    QueryOptions, BulkInsertOptions, UpdateOptions, PaginatedResult
-)
+from .exceptions import DatabaseError, TransactionError
+from .types import QueryOptions, BulkInsertOptions, UpdateOptions, PaginatedResult
 from .decorators import retry_on_deadlock, timeout, log_query_execution
 from .query_builder import QueryBuilder
 from .transactions import AsyncTransactionManager
@@ -35,17 +30,10 @@ from .utils import rows_to_dicts, build_where_clause, chunk_list
 logger = logging.getLogger(__name__)
 
 
-class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
+class AsyncPostgresDB(AsyncBaseDatabaseClient):
     """
-    Async PostgreSQL client optimized for e-commerce workloads
-    
-    Features:
-    - All writes are atomic by default
-    - Async connection pooling
-    - Automatic retry on deadlocks
-    - Query timeouts
-    - Built-in performance monitoring
-    - E-commerce specific optimizations
+    Async PostgreSQL client
+    Uses AsyncDatabaseOperations (NOT BaseDatabaseOperations)
     """
     
     def __init__(
@@ -54,14 +42,6 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         config: Optional[DatabaseConfig] = None,
         **kwargs
     ):
-        """
-        Initialize async database connection
-        
-        Args:
-            connection_string: PostgreSQL connection string
-            config: Pre-configured DatabaseConfig object
-            **kwargs: Configuration overrides
-        """
         # Get configuration
         if config:
             self.config = config
@@ -86,20 +66,23 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
             pool_pre_ping=True,
         )
         
-        # Initialize metadata and sync engine for table reflection
+        # Initialize metadata
         self.metadata = MetaData(schema=self.config.schema)
-        self.sync_engine = create_engine(self.config.connection_string)
         
-        # Initialize base operations
-        BaseDatabaseOperations.__init__(self, self.config, self.sync_engine, self.metadata)
+        # Initialize ASYNC operations (NOT sync)
+        self.async_ops = AsyncDatabaseOperations(
+            config=self.config,
+            async_engine=self.async_engine,
+            metadata=self.metadata
+        )
         
         # Initialize components
         self._query_builder = QueryBuilder()
         self._transaction_manager = AsyncTransactionManager(self.async_engine)
         
-        logger.info(f"AsyncPostgresDB initialized for e-commerce schema: {self.config.schema}")
+        logger.info(f"AsyncPostgresDB initialized for schema: {self.config.schema}")
     
-    # ==================== ATOMIC CREATE OPERATIONS ====================
+    # ============= ASYNC METHODS =============
     
     @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
@@ -110,23 +93,15 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         data: Dict[str, Any],
         returning: bool = True
     ) -> Optional[Dict[str, Any]]:
-        """
-        Atomic async insert operation for e-commerce entities
-        
-        Args:
-            table_name: Target table (users, products, orders, etc.)
-            data: Data to insert
-            returning: Whether to return inserted row
-            
-        Returns:
-            Inserted row or None
-        """
+        """Async create"""
         start_time = time.time()
-        table = self._get_table(table_name)
+        
+        # Get table using async operations
+        table = await self.async_ops._get_table(table_name)
         
         try:
             # Validate data
-            self._validate_data(data, "create")
+            self.async_ops._validate_data_async(data, "create")
             
             # Build and execute INSERT
             stmt = insert(table).values(**data)
@@ -139,7 +114,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                 if returning:
                     row = result.fetchone()
                     rows_affected = 1 if row else 0
-                    self._record_query_metrics(
+                    await self.async_ops._record_query_metrics_async(
                         operation="create",
                         table_name=table_name,
                         start_time=start_time,
@@ -147,7 +122,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                     )
                     return dict(row._mapping) if row else None
                 
-                self._record_query_metrics(
+                await self.async_ops._record_query_metrics_async(
                     operation="create",
                     table_name=table_name,
                     start_time=start_time,
@@ -156,80 +131,9 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                 return None
                 
         except IntegrityError as e:
-            self._handle_integrity_error(e, "create", table_name)
+            self.async_ops._handle_integrity_error_async(e, "create", table_name)
         except SQLAlchemyError as e:
-            self._handle_database_error(e, "create", table_name)
-    
-    # ==================== ATOMIC BULK CREATE ====================
-    
-    @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
-    @timeout(seconds=BULK_OPERATION_TIMEOUT)
-    @log_query_execution
-    async def abulk_create(
-        self,
-        table_name: str,
-        data_list: List[Dict[str, Any]],
-        options: Optional[BulkInsertOptions] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Atomic async bulk insert with batch processing
-        Optimized for e-commerce (products, orders, etc.)
-        
-        Args:
-            table_name: Target table
-            data_list: List of data dictionaries
-            options: Bulk insert configuration
-            
-        Returns:
-            List of inserted rows
-        """
-        if not data_list:
-            return []
-        
-        opts = options or BulkInsertOptions()
-        table = self._get_table(table_name)
-        all_rows = []
-        
-        start_time = time.time()
-        
-        try:
-            # Execute in single atomic transaction
-            async with self.async_engine.begin() as conn:
-                # Process in batches
-                for batch in chunk_list(data_list, opts.batch_size):
-                    stmt = insert(table).values(batch)
-                    
-                    # Handle conflicts (important for e-commerce)
-                    if opts.on_conflict_do_nothing:
-                        stmt = stmt.on_conflict_do_nothing()
-                    elif opts.on_conflict_do_update:
-                        stmt = stmt.on_conflict_do_update(
-                            constraint=opts.on_conflict_do_update.get("constraint"),
-                            set_=opts.on_conflict_do_update.get("set_", {})
-                        )
-                    
-                    if opts.return_rows:
-                        stmt = stmt.returning(table)
-                        result = await conn.execute(stmt)
-                        all_rows.extend(rows_to_dicts(result))
-                    else:
-                        await conn.execute(stmt)
-                
-                # Record metrics
-                self._record_query_metrics(
-                    operation="bulk_create",
-                    table_name=table_name,
-                    start_time=start_time,
-                    rows_affected=len(data_list)
-                )
-                return all_rows
-                
-        except IntegrityError as e:
-            self._handle_integrity_error(e, "bulk_create", table_name)
-        except SQLAlchemyError as e:
-            self._handle_database_error(e, "bulk_create", table_name)
-    
-    # ==================== ASYNC READ OPERATIONS ====================
+            self.async_ops._handle_database_error_async(e, "create", table_name)
     
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     @log_query_execution
@@ -239,28 +143,18 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         conditions: Optional[Dict[str, Any]] = None,
         options: Optional[QueryOptions] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Async read records with filtering
-        Optimized for e-commerce queries
-        
-        Args:
-            table_name: Target table
-            conditions: WHERE conditions
-            options: Query options (pagination, ordering, etc.)
-            
-        Returns:
-            List of records
-        """
+        """Async read"""
         start_time = time.time()
-        table = self._get_table(table_name)
+        
+        # Get table using async operations
+        table = await self.async_ops._get_table(table_name)
         
         # Validate conditions
         if conditions:
-            self._validate_conditions(conditions)
+            self.async_ops._validate_conditions_async(conditions)
         
         try:
             # Build query
-            # Convert dict to QueryOptions if needed
             if options is not None and isinstance(options, dict):
                 options = QueryOptions(**options)
             elif options is None:
@@ -268,13 +162,13 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                 
             stmt = self._query_builder.build_select_query(
                 table=table,
-                columns=options.columns if options else None,
+                columns=options.columns,
                 conditions=conditions,
-                order_by=options.order_by if options else None,
-                limit=options.limit if options else None,
-                offset=options.offset if options else 0,
-                distinct=options.distinct if options else False,
-                for_update=options.for_update if options else False
+                order_by=options.order_by,
+                limit=options.limit,
+                offset=options.offset,
+                distinct=options.distinct,
+                for_update=options.for_update
             )
             
             # Execute query
@@ -283,7 +177,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                 rows = rows_to_dicts(result)
                 
                 # Record metrics
-                self._record_query_metrics(
+                await self.async_ops._record_query_metrics_async(
                     operation="read",
                     table_name=table_name,
                     start_time=start_time,
@@ -292,9 +186,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                 return rows
                 
         except SQLAlchemyError as e:
-            self._handle_database_error(e, "read", table_name)
-    
-    # ==================== ATOMIC UPDATE OPERATIONS ====================
+            self.async_ops._handle_database_error_async(e, "read", table_name)
     
     @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
@@ -306,29 +198,20 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         conditions: Dict[str, Any],
         options: Optional[UpdateOptions] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Atomic async update operation
-        Essential for e-commerce (inventory updates, order status, etc.)
-        
-        Args:
-            table_name: Target table
-            data: Data to update
-            conditions: WHERE conditions
-            options: Update configuration
-            
-        Returns:
-            List of updated rows
-        """
+        """Async update"""
         start_time = time.time()
-        table = self._get_table(table_name)
+        
+        # Get table using async operations
+        table = await self.async_ops._get_table(table_name)
+        
         if options is not None and isinstance(options, dict):
             opts = UpdateOptions(**options)
         elif options is None:
             opts = UpdateOptions()
         
         # Validate
-        self._validate_data(data, "update")
-        self._validate_conditions(conditions)
+        self.async_ops._validate_data_async(data, "update")
+        self.async_ops._validate_conditions_async(conditions)
         
         try:
             # Build UPDATE statement
@@ -349,7 +232,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                     
                     if opts.returning:
                         rows = rows_to_dicts(result)
-                        self._record_query_metrics(
+                        await self.async_ops._record_query_metrics_async(
                             operation="update",
                             table_name=table_name,
                             start_time=start_time,
@@ -358,7 +241,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                         return rows
                     else:
                         rowcount = result.rowcount
-                        self._record_query_metrics(
+                        await self.async_ops._record_query_metrics_async(
                             operation="update",
                             table_name=table_name,
                             start_time=start_time,
@@ -371,7 +254,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                     
                     if opts.returning:
                         rows = rows_to_dicts(result)
-                        self._record_query_metrics(
+                        await self.async_ops._record_query_metrics_async(
                             operation="update",
                             table_name=table_name,
                             start_time=start_time,
@@ -380,7 +263,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                         return rows
                     else:
                         rowcount = result.rowcount
-                        self._record_query_metrics(
+                        await self.async_ops._record_query_metrics_async(
                             operation="update",
                             table_name=table_name,
                             start_time=start_time,
@@ -389,11 +272,9 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                         return []
                 
         except IntegrityError as e:
-            self._handle_integrity_error(e, "update", table_name)
+            self.async_ops._handle_integrity_error_async(e, "update", table_name)
         except SQLAlchemyError as e:
-            self._handle_database_error(e, "update", table_name)
-    
-    # ==================== ATOMIC DELETE OPERATIONS ====================
+            self.async_ops._handle_database_error_async(e, "update", table_name)
     
     @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
@@ -404,21 +285,13 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         conditions: Dict[str, Any],
         returning: bool = False
     ) -> Union[int, List[Dict[str, Any]]]:
-        """
-        Atomic async delete operation
-        
-        Args:
-            table_name: Target table
-            conditions: WHERE conditions
-            returning: Whether to return deleted rows
-            
-        Returns:
-            Number of deleted rows or list of deleted rows
-        """
+        """Async delete"""
         start_time = time.time()
-        table = self._get_table(table_name)
         
-        self._validate_conditions(conditions)
+        # Get table using async operations
+        table = await self.async_ops._get_table(table_name)
+        
+        self.async_ops._validate_conditions_async(conditions)
         
         try:
             # Build DELETE statement
@@ -438,7 +311,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                 
                 if returning:
                     rows = rows_to_dicts(result)
-                    self._record_query_metrics(
+                    await self.async_ops._record_query_metrics_async(
                         operation="delete",
                         table_name=table_name,
                         start_time=start_time,
@@ -447,7 +320,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                     return rows
                 else:
                     rowcount = result.rowcount
-                    self._record_query_metrics(
+                    await self.async_ops._record_query_metrics_async(
                         operation="delete",
                         table_name=table_name,
                         start_time=start_time,
@@ -456,9 +329,9 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                     return rowcount
                 
         except SQLAlchemyError as e:
-            self._handle_database_error(e, "delete", table_name)
+            self.async_ops._handle_database_error_async(e, "delete", table_name)
     
-    # ==================== E-COMMERCE SPECIFIC METHODS ====================
+    # ============= E-COMMERCE SPECIFIC METHODS =============
     
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     async def aread_one(
@@ -466,20 +339,20 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         table_name: str,
         conditions: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """Read single record (optimized for lookups)"""
+        """Read single record"""
         options = QueryOptions(limit=1)
         results = await self.aread(table_name, conditions, options)
         return results[0] if results else None
     
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     async def aread_by_id(self, table_name: str, record_id: Any) -> Optional[Dict[str, Any]]:
-        """Read record by ID (common e-commerce pattern)"""
+        """Read record by ID"""
         return await self.aread_one(table_name, {"id": record_id})
     
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     async def aexists(self, table_name: str, conditions: Dict[str, Any]) -> bool:
-        """Check if record exists (for validation)"""
-        table = self._get_table(table_name)
+        """Check if record exists"""
+        table = await self.async_ops._get_table(table_name)
         stmt = select(func.count()).select_from(table)
         
         where_clauses = build_where_clause(table, conditions)
@@ -496,8 +369,8 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
     
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     async def acount(self, table_name: str, conditions: Optional[Dict[str, Any]] = None) -> int:
-        """Count records (for pagination)"""
-        table = self._get_table(table_name)
+        """Count records"""
+        table = await self.async_ops._get_table(table_name)
         stmt = select(func.count()).select_from(table)
         
         if conditions:
@@ -520,19 +393,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         per_page: int = 20,
         order_by: Optional[List[tuple]] = None
     ) -> PaginatedResult:
-        """
-        Paginate records (essential for e-commerce listings)
-        
-        Args:
-            table_name: Target table
-            conditions: Filter conditions
-            page: Page number (1-indexed)
-            per_page: Items per page
-            order_by: Sorting criteria
-            
-        Returns:
-            Paginated result with metadata
-        """
+        """Async pagination"""
         # Get total count
         total = await self.acount(table_name, conditions)
         
@@ -558,7 +419,65 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
             total_pages=total_pages
         )
     
-    # ==================== RAW SQL WITH ATOMIC SUPPORT ====================
+    # ============= BULK OPERATIONS =============
+    
+    @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
+    @timeout(seconds=BULK_OPERATION_TIMEOUT)
+    @log_query_execution
+    async def abulk_create(
+        self,
+        table_name: str,
+        data_list: List[Dict[str, Any]],
+        options: Optional[BulkInsertOptions] = None
+    ) -> List[Dict[str, Any]]:
+        """Async bulk create"""
+        if not data_list:
+            return []
+        
+        opts = options or BulkInsertOptions()
+        table = await self.async_ops._get_table(table_name)
+        all_rows = []
+        
+        start_time = time.time()
+        
+        try:
+            # Execute in single atomic transaction
+            async with self.async_engine.begin() as conn:
+                # Process in batches
+                for batch in chunk_list(data_list, opts.batch_size):
+                    stmt = insert(table).values(batch)
+                    
+                    # Handle conflicts
+                    if opts.on_conflict_do_nothing:
+                        stmt = stmt.on_conflict_do_nothing()
+                    elif opts.on_conflict_do_update:
+                        stmt = stmt.on_conflict_do_update(
+                            constraint=opts.on_conflict_do_update.get("constraint"),
+                            set_=opts.on_conflict_do_update.get("set_", {})
+                        )
+                    
+                    if opts.return_rows:
+                        stmt = stmt.returning(table)
+                        result = await conn.execute(stmt)
+                        all_rows.extend(rows_to_dicts(result))
+                    else:
+                        await conn.execute(stmt)
+                
+                # Record metrics
+                await self.async_ops._record_query_metrics_async(
+                    operation="bulk_create",
+                    table_name=table_name,
+                    start_time=start_time,
+                    rows_affected=len(data_list)
+                )
+                return all_rows
+                
+        except IntegrityError as e:
+            self.async_ops._handle_integrity_error_async(e, "bulk_create", table_name)
+        except SQLAlchemyError as e:
+            self.async_ops._handle_database_error_async(e, "bulk_create", table_name)
+    
+    # ============= RAW SQL =============
     
     @timeout(seconds=BULK_OPERATION_TIMEOUT)
     @log_query_execution
@@ -569,18 +488,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         fetch_results: bool = True,
         atomic: bool = False
     ) -> Union[List[Dict[str, Any]], int, None]:
-        """
-        Execute raw SQL with atomic transaction support
-        
-        Args:
-            sql_query: SQL query string
-            parameters: Query parameters
-            fetch_results: Whether to fetch results
-            atomic: Whether to execute in transaction
-            
-        Returns:
-            Query results or row count
-        """
+        """Execute raw SQL"""
         start_time = time.time()
         sql_lower = sql_query.strip().lower()
         
@@ -597,7 +505,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                     
                     if fetch_results and result.returns_rows:
                         rows = rows_to_dicts(result)
-                        self._record_query_metrics(
+                        await self.async_ops._record_query_metrics_async(
                             operation="raw_sql_write",
                             table_name="raw_sql",
                             start_time=start_time,
@@ -606,7 +514,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                         return rows
                     else:
                         rowcount = result.rowcount
-                        self._record_query_metrics(
+                        await self.async_ops._record_query_metrics_async(
                             operation="raw_sql_write",
                             table_name="raw_sql",
                             start_time=start_time,
@@ -619,7 +527,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                     
                     if fetch_results and result.returns_rows:
                         rows = rows_to_dicts(result)
-                        self._record_query_metrics(
+                        await self.async_ops._record_query_metrics_async(
                             operation="raw_sql_read",
                             table_name="raw_sql",
                             start_time=start_time,
@@ -628,7 +536,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                         return rows
                     else:
                         rowcount = result.rowcount
-                        self._record_query_metrics(
+                        await self.async_ops._record_query_metrics_async(
                             operation="raw_sql_write",
                             table_name="raw_sql",
                             start_time=start_time,
@@ -637,21 +545,13 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                         return rowcount
                     
         except SQLAlchemyError as e:
-            self._handle_database_error(e, "raw_sql", "raw_sql")
+            self.async_ops._handle_database_error_async(e, "raw_sql", "raw_sql")
     
-    # ==================== ASYNC TRANSACTION MANAGEMENT ====================
+    # ============= TRANSACTIONS =============
     
     @asynccontextmanager
     async def atransaction(self, isolation_level: str = READ_COMMITTED):
-        """
-        Async context manager for database transactions
-        Essential for e-commerce order processing
-        
-        Usage:
-            async with db.atransaction():
-                await db.acreate("orders", order_data)
-                await db.aupdate("inventory", update_data, conditions)
-        """
+        """Async transaction"""
         async with self._transaction_manager.begin(isolation_level=isolation_level) as conn:
             try:
                 yield conn
@@ -659,28 +559,10 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                 logger.error(f"Async transaction failed: {e}")
                 raise TransactionError(f"Async transaction failed: {e}")
     
-    # ==================== SYNC METHODS (FOR COMPATIBILITY) ====================
-    
-    def create(self, *args, **kwargs):
-        """Sync create (not recommended for async context)"""
-        raise RuntimeError("Use async methods in async context. Call acreate() instead.")
-    
-    def read(self, *args, **kwargs):
-        """Sync read (not recommended for async context)"""
-        raise RuntimeError("Use async methods in async context. Call aread() instead.")
-    
-    def update(self, *args, **kwargs):
-        """Sync update (not recommended for async context)"""
-        raise RuntimeError("Use async methods in async context. Call aupdate() instead.")
-    
-    def delete(self, *args, **kwargs):
-        """Sync delete (not recommended for async context)"""
-        raise RuntimeError("Use async methods in async context. Call adelete() instead.")
-    
-    # ==================== UTILITIES ====================
+    # ============= UTILITIES =============
     
     async def ahealth_check(self) -> bool:
-        """Async check database health"""
+        """Async health check"""
         try:
             async with self.async_engine.connect() as conn:
                 result = await conn.execute(text("SELECT 1"))
@@ -690,7 +572,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
             return False
     
     async def aget_stats(self) -> Dict[str, Any]:
-        """Get async database statistics"""
+        """Get async stats"""
         pool = self.async_engine.pool
         
         return {
@@ -700,9 +582,9 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
                 "checked_out": pool.checkedout(),
                 "overflow": pool.overflow(),
             },
-            "query_stats": self.get_query_stats(),
+            "query_stats": await self.async_ops.get_query_stats_async(),
             "schema": self.config.schema,
-            "tables_cached": len(self._table_cache),
+            "tables_cached": len(self.async_ops._table_cache),
             "config": {
                 "pool_size": self.config.pool_size,
                 "max_overflow": self.config.max_overflow,
@@ -712,194 +594,70 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient, BaseDatabaseOperations):
         }
     
     async def aclose(self):
-        """Close async database connection"""
+        """Close async connection"""
         await self.async_engine.dispose()
-        self.sync_engine.dispose()
         logger.info("Async database connection closed")
     
-    def health_check(self) -> bool:
-        """Sync health check (delegates to async)"""
-        return asyncio.run(self.ahealth_check())
+    # ============= ABSTRACT METHODS IMPLEMENTATION =============
     
-    def get_stats(self) -> Dict[str, Any]:
-        """Sync get stats (delegates to async)"""
-        return asyncio.run(self.aget_stats())
+    async def create(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.acreate(*args, **kwargs)
     
-    def close(self):
-        """Sync close (delegates to async)"""
-        asyncio.run(self.aclose())
+    async def read(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.aread(*args, **kwargs)
     
-    # ==================== E-COMMERCE HELPER METHODS ====================
+    async def update(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.aupdate(*args, **kwargs)
     
-    async def increment_counter(
-        self,
-        table_name: str,
-        column_name: str,
-        conditions: Dict[str, Any],
-        amount: int = 1
-    ) -> int:
-        """
-        Atomic counter increment (for views, likes, etc.)
-        
-        Args:
-            table_name: Target table
-            column_name: Column to increment
-            conditions: Row selection conditions
-            amount: Amount to increment
-            
-        Returns:
-            New value after increment
-        """
-        sql = f"""
-        UPDATE {table_name} 
-        SET {column_name} = {column_name} + :amount 
-        WHERE id = :id
-        RETURNING {column_name}
-        """
-        
-        result = await self.aexecute_raw_sql(
-            sql,
-            parameters={"amount": amount, "id": conditions.get("id")},
-            fetch_results=True,
-            atomic=True
-        )
-        
-        return result[0][column_name] if result else 0
+    async def delete(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.adelete(*args, **kwargs)
     
-    async def batch_update_status(
-        self,
-        table_name: str,
-        record_ids: List[Any],
-        new_status: str,
-        status_column: str = "status"
-    ) -> int:
-        """
-        Batch update status for multiple records
-        Useful for order processing, inventory updates
-        
-        Args:
-            table_name: Target table
-            record_ids: List of record IDs
-            new_status: New status value
-            status_column: Status column name
-            
-        Returns:
-            Number of records updated
-        """
-        if not record_ids:
-            return 0
-        
-        sql = f"""
-        UPDATE {table_name} 
-        SET {status_column} = :new_status 
-        WHERE id = ANY(:ids)
-        """
-        
-        result = await self.aexecute_raw_sql(
-            sql,
-            parameters={"new_status": new_status, "ids": record_ids},
-            fetch_results=False,
-            atomic=True
-        )
-        
-        return result if isinstance(result, int) else 0
+    async def bulk_create(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.abulk_create(*args, **kwargs)
     
-    # ==================== ABSTRACT METHODS IMPLEMENTATION ====================
-    # These methods are required by AsyncBaseDatabaseClient abstract class
+    async def count(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.acount(*args, **kwargs)
     
-    async def bulk_create(
-        self,
-        table_name: str,
-        data_list: List[Dict[str, Any]],
-        options: Optional[BulkInsertOptions] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Sync interface for bulk create - required by abstract class
-        """
-        return await self.abulk_create(table_name, data_list, options)
+    async def execute_raw_sql(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.aexecute_raw_sql(*args, **kwargs)
     
-    async def count(
-        self,
-        table_name: str,
-        conditions: Optional[Dict[str, Any]] = None
-    ) -> int:
-        """
-        Sync interface for count - required by abstract class
-        """
-        return await self.acount(table_name, conditions)
+    async def exists(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.aexists(*args, **kwargs)
     
-    async def execute_raw_sql(
-        self,
-        sql_query: str,
-        parameters: Optional[Dict[str, Any]] = None,
-        fetch_results: bool = True
-    ) -> Union[List[Dict[str, Any]], int, None]:
-        """
-        Sync interface for raw SQL - required by abstract class
-        """
-        return await self.aexecute_raw_sql(
-            sql_query=sql_query,
-            parameters=parameters,
-            fetch_results=fetch_results,
-            atomic=False
-        )
+    async def paginate(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.apaginate(*args, **kwargs)
     
-    async def exists(
-        self,
-        table_name: str,
-        conditions: Dict[str, Any]
-    ) -> bool:
-        """
-        Sync interface for exists check - required by abstract class
-        """
-        return await self.aexists(table_name, conditions)
+    async def read_by_id(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.aread_by_id(*args, **kwargs)
     
-    async def paginate(
-        self,
-        table_name: str,
-        conditions: Optional[Dict[str, Any]] = None,
-        page: int = 1,
-        per_page: int = 20,
-        order_by: Optional[List[tuple]] = None
-    ) -> PaginatedResult:
-        """
-        Sync interface for pagination - required by abstract class
-        """
-        return await self.apaginate(
-            table_name=table_name,
-            conditions=conditions,
-            page=page,
-            per_page=per_page,
-            order_by=order_by
-        )
-    
-    async def read_by_id(
-        self,
-        table_name: str,
-        record_id: Any
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Sync interface for read by ID - required by abstract class
-        """
-        return await self.aread_by_id(table_name, record_id)
-    
-    async def read_one(
-        self,
-        table_name: str,
-        conditions: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Sync interface for read one - required by abstract class
-        """
-        return await self.aread_one(table_name, conditions)
+    async def read_one(self, *args, **kwargs):
+        """Required by abstract class"""
+        return await self.aread_one(*args, **kwargs)
     
     @asynccontextmanager
     async def transaction(self, isolation_level: str = "READ COMMITTED"):
-        """
-        Sync interface for transaction - required by abstract class
-        
-        Note: This wraps the async atransaction method
-        """
+        """Required by abstract class"""
         async with self.atransaction(isolation_level=isolation_level) as conn:
             yield conn
     
+    def health_check(self) -> bool:
+        """Sync health check"""
+        return asyncio.run(self.ahealth_check())
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Sync get stats"""
+        return asyncio.run(self.aget_stats())
+    
+    def close(self):
+        """Sync close"""
+        asyncio.run(self.aclose())

@@ -1,0 +1,6 @@
+# Core OpenSearch dependencies
+opensearch-py>=2.0.0
+typing-extensions>=4.5.0
+
+# For connection pooling and async operations
+aiohttp>=3.8.0

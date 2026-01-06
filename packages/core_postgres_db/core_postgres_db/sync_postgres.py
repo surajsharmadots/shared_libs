@@ -1,30 +1,25 @@
 # packages/core_postgres_db/core_postgres_db/sync_postgres.py
 """
-Synchronous PostgreSQL client for legacy systems - Sonarqube compliant
+Synchronous PostgreSQL client - uses BaseDatabaseOperations
 """
 import logging
 import time
 from typing import Any, Dict, List, Optional, Union
 from contextlib import contextmanager
 
-from sqlalchemy import  insert, select, update, delete, text, func, create_engine, MetaData
+from sqlalchemy import insert, select, update, delete, text, func, create_engine, MetaData
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from .base_crud import BaseDatabaseClient
-from .base_operations import BaseDatabaseOperations
+from .base_operations import BaseDatabaseOperations 
 from .config import DatabaseConfig, get_database_config
 from .constants import (
     DEFAULT_TIMEOUT_SECONDS, BULK_OPERATION_TIMEOUT, MAX_DEADLOCK_RETRIES,
     READ_COMMITTED
 )
-from .exceptions import (
-    DatabaseError,TransactionError
-)
-from .types import (
-    QueryOptions, BulkInsertOptions, UpdateOptions,
-    PaginatedResult
-)
+from .exceptions import DatabaseError, TransactionError
+from .types import QueryOptions, BulkInsertOptions, UpdateOptions, PaginatedResult
 from .decorators import retry_on_deadlock, timeout, log_query_execution
 from .query_builder import QueryBuilder
 from .transactions import TransactionManager
@@ -35,10 +30,8 @@ logger = logging.getLogger(__name__)
 
 class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
     """
-    Synchronous PostgreSQL client for legacy systems
-    
-    Note: For e-commerce microservices, prefer AsyncPostgresDB
-    This is provided for compatibility with sync codebases
+    Synchronous PostgreSQL client
+    Uses BaseDatabaseOperations (sync version)
     """
     
     def __init__(
@@ -47,14 +40,6 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         config: Optional[DatabaseConfig] = None,
         **kwargs
     ):
-        """
-        Initialize sync database connection
-        
-        Args:
-            connection_string: PostgreSQL connection string
-            config: Pre-configured DatabaseConfig object
-            **kwargs: Configuration overrides
-        """
         # Get configuration
         if config:
             self.config = config
@@ -78,8 +63,12 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         # Initialize metadata
         self.metadata = MetaData(schema=self.config.schema)
         
-        # Initialize base operations
-        BaseDatabaseOperations.__init__(self, self.config, self.engine, self.metadata)
+        # Initialize SYNC operations
+        super().__init__(
+            config=self.config,
+            engine=self.engine,  # SYNC engine
+            metadata=self.metadata
+        )
         
         # Initialize components
         self._query_builder = QueryBuilder()
@@ -87,7 +76,7 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         
         logger.info(f"SyncPostgresDB initialized for schema: {self.config.schema}")
     
-    # ==================== ATOMIC CREATE OPERATIONS ====================
+    # ============= SYNC METHODS =============
     
     @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
@@ -98,19 +87,9 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         data: Dict[str, Any],
         returning: bool = True
     ) -> Optional[Dict[str, Any]]:
-        """
-        Atomic sync insert operation
-        
-        Args:
-            table_name: Target table
-            data: Data to insert
-            returning: Whether to return inserted row
-            
-        Returns:
-            Inserted row or None
-        """
+        """Sync create"""
         start_time = time.time()
-        table = self._get_table(table_name)
+        table = self._get_table(table_name)  # SYNC method
         
         try:
             # Validate data
@@ -148,76 +127,6 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         except SQLAlchemyError as e:
             self._handle_database_error(e, "create", table_name)
     
-    # ==================== ATOMIC BULK CREATE ====================
-    
-    @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
-    @timeout(seconds=BULK_OPERATION_TIMEOUT)
-    @log_query_execution
-    def bulk_create(
-        self,
-        table_name: str,
-        data_list: List[Dict[str, Any]],
-        options: Optional[BulkInsertOptions] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Atomic sync bulk insert with batch processing
-        
-        Args:
-            table_name: Target table
-            data_list: List of data dictionaries
-            options: Bulk insert configuration
-            
-        Returns:
-            List of inserted rows
-        """
-        if not data_list:
-            return []
-        
-        opts = options or BulkInsertOptions()
-        table = self._get_table(table_name)
-        all_rows = []
-        
-        start_time = time.time()
-        
-        try:
-            # Execute in single atomic transaction
-            with self.engine.begin() as conn:
-                # Process in batches
-                for batch in chunk_list(data_list, opts.batch_size):
-                    stmt = insert(table).values(batch)
-                    
-                    # Handle conflicts
-                    if opts.on_conflict_do_nothing:
-                        stmt = stmt.on_conflict_do_nothing()
-                    elif opts.on_conflict_do_update:
-                        stmt = stmt.on_conflict_do_update(
-                            constraint=opts.on_conflict_do_update.get("constraint"),
-                            set_=opts.on_conflict_do_update.get("set_", {})
-                        )
-                    
-                    if opts.return_rows:
-                        stmt = stmt.returning(table)
-                        result = conn.execute(stmt)
-                        all_rows.extend(rows_to_dicts(result))
-                    else:
-                        conn.execute(stmt)
-                
-                # Record metrics
-                self._record_query_metrics(
-                    operation="bulk_create",
-                    table_name=table_name,
-                    start_time=start_time,
-                    rows_affected=len(data_list)
-                )
-                return all_rows
-                
-        except IntegrityError as e:
-            self._handle_integrity_error(e, "bulk_create", table_name)
-        except SQLAlchemyError as e:
-            self._handle_database_error(e, "bulk_create", table_name)
-    
-    # ==================== READ OPERATIONS ====================
-    
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     @log_query_execution
     def read(
@@ -226,19 +135,9 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         conditions: Optional[Dict[str, Any]] = None,
         options: Optional[QueryOptions] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Sync read records with filtering
-        
-        Args:
-            table_name: Target table
-            conditions: WHERE conditions
-            options: Query options
-            
-        Returns:
-            List of records
-        """
+        """Sync read"""
         start_time = time.time()
-        table = self._get_table(table_name)
+        table = self._get_table(table_name)  # SYNC method
         
         # Validate conditions
         if conditions:
@@ -274,8 +173,6 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         except SQLAlchemyError as e:
             self._handle_database_error(e, "read", table_name)
     
-    # ==================== ATOMIC UPDATE OPERATIONS ====================
-    
     @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     @log_query_execution
@@ -286,20 +183,9 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         conditions: Dict[str, Any],
         options: Optional[UpdateOptions] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Atomic sync update operation
-        
-        Args:
-            table_name: Target table
-            data: Data to update
-            conditions: WHERE conditions
-            options: Update configuration
-            
-        Returns:
-            List of updated rows
-        """
+        """Sync update"""
         start_time = time.time()
-        table = self._get_table(table_name)
+        table = self._get_table(table_name)  # SYNC method
         opts = options or UpdateOptions()
         
         # Validate
@@ -369,8 +255,6 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         except SQLAlchemyError as e:
             self._handle_database_error(e, "update", table_name)
     
-    # ==================== ATOMIC DELETE OPERATIONS ====================
-    
     @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     @log_query_execution
@@ -380,19 +264,9 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         conditions: Dict[str, Any],
         returning: bool = False
     ) -> Union[int, List[Dict[str, Any]]]:
-        """
-        Atomic sync delete operation
-        
-        Args:
-            table_name: Target table
-            conditions: WHERE conditions
-            returning: Whether to return deleted rows
-            
-        Returns:
-            Number of deleted rows or list of deleted rows
-        """
+        """Sync delete"""
         start_time = time.time()
-        table = self._get_table(table_name)
+        table = self._get_table(table_name)  # SYNC method
         
         self._validate_conditions(conditions)
         
@@ -434,7 +308,65 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         except SQLAlchemyError as e:
             self._handle_database_error(e, "delete", table_name)
     
-    # ==================== QUERY METHODS ====================
+    # ============= BULK OPERATIONS =============
+    
+    @retry_on_deadlock(max_retries=MAX_DEADLOCK_RETRIES)
+    @timeout(seconds=BULK_OPERATION_TIMEOUT)
+    @log_query_execution
+    def bulk_create(
+        self,
+        table_name: str,
+        data_list: List[Dict[str, Any]],
+        options: Optional[BulkInsertOptions] = None
+    ) -> List[Dict[str, Any]]:
+        """Sync bulk create"""
+        if not data_list:
+            return []
+        
+        opts = options or BulkInsertOptions()
+        table = self._get_table(table_name)  # SYNC method
+        all_rows = []
+        
+        start_time = time.time()
+        
+        try:
+            # Execute in single atomic transaction
+            with self.engine.begin() as conn:
+                # Process in batches
+                for batch in chunk_list(data_list, opts.batch_size):
+                    stmt = insert(table).values(batch)
+                    
+                    # Handle conflicts
+                    if opts.on_conflict_do_nothing:
+                        stmt = stmt.on_conflict_do_nothing()
+                    elif opts.on_conflict_do_update:
+                        stmt = stmt.on_conflict_do_update(
+                            constraint=opts.on_conflict_do_update.get("constraint"),
+                            set_=opts.on_conflict_do_update.get("set_", {})
+                        )
+                    
+                    if opts.return_rows:
+                        stmt = stmt.returning(table)
+                        result = conn.execute(stmt)
+                        all_rows.extend(rows_to_dicts(result))
+                    else:
+                        conn.execute(stmt)
+                
+                # Record metrics
+                self._record_query_metrics(
+                    operation="bulk_create",
+                    table_name=table_name,
+                    start_time=start_time,
+                    rows_affected=len(data_list)
+                )
+                return all_rows
+                
+        except IntegrityError as e:
+            self._handle_integrity_error(e, "bulk_create", table_name)
+        except SQLAlchemyError as e:
+            self._handle_database_error(e, "bulk_create", table_name)
+    
+    # ============= QUERY METHODS =============
     
     @timeout(seconds=DEFAULT_TIMEOUT_SECONDS)
     def read_one(
@@ -496,19 +428,7 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         per_page: int = 20,
         order_by: Optional[List[tuple]] = None
     ) -> PaginatedResult:
-        """
-        Paginate records
-        
-        Args:
-            table_name: Target table
-            conditions: Filter conditions
-            page: Page number (1-indexed)
-            per_page: Items per page
-            order_by: Sorting criteria
-            
-        Returns:
-            Paginated result with metadata
-        """
+        """Sync pagination"""
         # Get total count
         total = self.count(table_name, conditions)
         
@@ -534,7 +454,7 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
             total_pages=total_pages
         )
     
-    # ==================== RAW SQL WITH ATOMIC SUPPORT ====================
+    # ============= RAW SQL =============
     
     @timeout(seconds=BULK_OPERATION_TIMEOUT)
     @log_query_execution
@@ -545,18 +465,7 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         fetch_results: bool = True,
         atomic: bool = False
     ) -> Union[List[Dict[str, Any]], int, None]:
-        """
-        Execute raw SQL with atomic transaction support
-        
-        Args:
-            sql_query: SQL query string
-            parameters: Query parameters
-            fetch_results: Whether to fetch results
-            atomic: Whether to execute in transaction
-            
-        Returns:
-            Query results or row count
-        """
+        """Execute raw SQL"""
         start_time = time.time()
         sql_lower = sql_query.strip().lower()
         
@@ -615,18 +524,11 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         except SQLAlchemyError as e:
             self._handle_database_error(e, "raw_sql", "raw_sql")
     
-    # ==================== TRANSACTION MANAGEMENT ====================
+    # ============= TRANSACTIONS =============
     
     @contextmanager
     def transaction(self, isolation_level: str = READ_COMMITTED):
-        """
-        Context manager for database transactions
-        
-        Usage:
-            with db.transaction():
-                db.create("users", user_data)
-                db.update("profiles", profile_data, conditions)
-        """
+        """Sync transaction"""
         with self._transaction_manager.begin(isolation_level=isolation_level) as conn:
             try:
                 yield conn
@@ -634,32 +536,10 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
                 logger.error(f"Transaction failed: {e}")
                 raise TransactionError(f"Transaction failed: {e}")
     
-    # ==================== ASYNC METHODS (NOT IMPLEMENTED) ====================
-    
-    async def acreate(self, *args, **kwargs):
-        """Async create (not available in sync client)"""
-        raise NotImplementedError("Async methods not available in SyncPostgresDB")
-    
-    async def aread(self, *args, **kwargs):
-        """Async read (not available in sync client)"""
-        raise NotImplementedError("Async methods not available in SyncPostgresDB")
-    
-    async def aupdate(self, *args, **kwargs):
-        """Async update (not available in sync client)"""
-        raise NotImplementedError("Async methods not available in SyncPostgresDB")
-    
-    async def adelete(self, *args, **kwargs):
-        """Async delete (not available in sync client)"""
-        raise NotImplementedError("Async methods not available in SyncPostgresDB")
-    
-    async def atransaction(self, *args, **kwargs):
-        """Async transaction (not available in sync client)"""
-        raise NotImplementedError("Async methods not available in SyncPostgresDB")
-    
-    # ==================== UTILITIES ====================
+    # ============= UTILITIES =============
     
     def health_check(self) -> bool:
-        """Check database health"""
+        """Sync health check"""
         try:
             with self.engine.connect() as conn:
                 result = conn.execute(text("SELECT 1"))
@@ -669,7 +549,7 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
             return False
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get database statistics"""
+        """Get sync stats"""
         pool = self.engine.pool
         
         return {
@@ -691,6 +571,28 @@ class SyncPostgresDB(BaseDatabaseClient, BaseDatabaseOperations):
         }
     
     def close(self):
-        """Close database connection"""
+        """Close sync connection"""
         self.engine.dispose()
         logger.info("Sync database connection closed")
+    
+    # ============= ASYNC METHODS (NOT IMPLEMENTED) =============
+    
+    async def acreate(self, *args, **kwargs):
+        """Async create not available"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
+    
+    async def aread(self, *args, **kwargs):
+        """Async read not available"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
+    
+    async def aupdate(self, *args, **kwargs):
+        """Async update not available"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
+    
+    async def adelete(self, *args, **kwargs):
+        """Async delete not available"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")
+    
+    async def atransaction(self, *args, **kwargs):
+        """Async transaction not available"""
+        raise NotImplementedError("Async methods not available in SyncPostgresDB")

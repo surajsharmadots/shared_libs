@@ -1,14 +1,13 @@
 # packages/core_postgres_db/core_postgres_db/base_operations.py
 """
-Common operations shared between sync and async implementations
-Sonarqube compliant: Reduces code duplication
+PURE SYNC operations - Sonarqube compliant
 """
 import logging
 import time
 from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
 
-from sqlalchemy import Table, MetaData
+from sqlalchemy import Table, MetaData, inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -24,26 +23,25 @@ logger = logging.getLogger(__name__)
 
 class BaseDatabaseOperations:
     """
-    Common database operations to avoid code duplication
-    This class contains shared logic between sync and async implementations
+    PURE SYNC database operations
+    Contains ONLY sync methods
     """
     
     def __init__(self, config, engine: Engine, metadata: MetaData):
-        """Initialize with shared components"""
+        """Initialize with SYNC components"""
         self.config = config
-        self.engine = engine
+        self.engine = engine  # SYNC engine
         self.metadata = metadata
         self._table_cache: Dict[str, Table] = {}
         self._query_stats = QueryStats()
         
-        logger.info(f"Database operations initialized for schema: {config.schema}")
+        logger.info(f"SYNC Database operations initialized for schema: {config.schema}")
     
-    # ============= Table Management =============
+    # ============= Table Management (SYNC) =============
     
     def _get_table(self, table_name: str) -> Table:
         """
-        Get table with caching and validation
-        Shared between sync and async
+        Get table with caching - SYNC VERSION
         """
         if not table_name:
             raise ValueError("Table name cannot be empty")
@@ -51,21 +49,33 @@ class BaseDatabaseOperations:
         safe_name = safe_table_ref(table_name, TABLE_NAME_PATTERN)
         
         if safe_name not in self._table_cache:
-            table = Table(
-                safe_name,
-                self.metadata,
-                autoload_with=self.engine,
-                schema=self.config.schema,
-                extend_existing=True
-            )
-            self._table_cache[safe_name] = table
+            try:
+                # SYNC table reflection
+                table = Table(
+                    safe_name,
+                    self.metadata,
+                    autoload_with=self.engine,  # SYNC engine
+                    schema=self.config.schema,
+                    extend_existing=True
+                )
+                self._table_cache[safe_name] = table
+                logger.debug(f"SYNC: Table {safe_name} reflected successfully")
+                
+            except Exception as e:
+                logger.warning(f"SYNC: Failed to autoload table {safe_name}: {e}")
+                # Fallback: create minimal table
+                table = Table(
+                    safe_name,
+                    self.metadata,
+                    schema=self.config.schema
+                )
+                self._table_cache[safe_name] = table
         
         return self._table_cache[safe_name]
     
     def get_table_info(self, table_name: str) -> Dict[str, Any]:
         """
-        Get table metadata information
-        Shared between sync and async
+        Get table metadata information - SYNC
         """
         table = self._get_table(table_name)
         
@@ -92,7 +102,7 @@ class BaseDatabaseOperations:
             ]
         }
     
-    # ============= Error Handling =============
+    # ============= Error Handling (SYNC) =============
     
     def _handle_integrity_error(
         self, 
@@ -101,8 +111,7 @@ class BaseDatabaseOperations:
         table_name: str
     ) -> None:
         """
-        Handle integrity errors (duplicate keys, constraints)
-        Shared error handling logic
+        Handle integrity errors - SYNC
         """
         error_msg = str(error).lower()
         
@@ -126,14 +135,13 @@ class BaseDatabaseOperations:
         table_name: str
     ) -> None:
         """
-        Handle general database errors
-        Shared error handling logic
+        Handle general database errors - SYNC
         """
         raise DatabaseError(
             f"Database error in {operation} for table '{table_name}': {error}"
         )
     
-    # ============= Metrics Recording =============
+    # ============= Metrics Recording (SYNC) =============
     
     def _record_query_metrics(
         self,
@@ -145,11 +153,10 @@ class BaseDatabaseOperations:
         error: Optional[str] = None
     ) -> None:
         """
-        Record query execution metrics
-        Shared metrics logic
+        Record query execution metrics - SYNC
         """
         elapsed = time.time() - start_time
-        key = f"{operation}:{table_name}"
+        key = f"sync_{operation}:{table_name}"
         
         if operation in ["create", "update", "delete", "bulk_create"]:
             self._query_stats.record_write(
@@ -168,10 +175,10 @@ class BaseDatabaseOperations:
                 error=error
             )
     
-    # ============= Validation Methods =============
+    # ============= Validation Methods (SYNC) =============
     
     def _validate_conditions(self, conditions: Dict[str, Any]) -> None:
-        """Validate query conditions"""
+        """Validate query conditions - SYNC"""
         if conditions is None:
             return
         
@@ -184,40 +191,39 @@ class BaseDatabaseOperations:
                 raise ValueError(f"Condition key must be string, got {type(key)}")
     
     def _validate_data(self, data: Dict[str, Any], operation: str) -> None:
-        """Validate data for create/update operations"""
+        """Validate data for create/update operations - SYNC"""
         if not data:
             raise ValueError(f"Data cannot be empty for {operation}")
         
         if not isinstance(data, dict):
             raise ValueError(f"Data must be a dictionary for {operation}")
     
-    # ============= Utility Methods =============
+    # ============= Utility Methods (SYNC) =============
     
     def clear_table_cache(self) -> None:
-        """Clear the table metadata cache"""
+        """Clear the table metadata cache - SYNC"""
         self._table_cache.clear()
-        logger.debug("Table cache cleared")
+        logger.debug("SYNC Table cache cleared")
     
     def get_cached_tables(self) -> List[str]:
-        """Get list of cached tables"""
+        """Get list of cached tables - SYNC"""
         return list(self._table_cache.keys())
     
     def get_query_stats(self) -> Dict[str, Any]:
-        """Get query performance statistics"""
+        """Get query performance statistics - SYNC"""
         return self._query_stats.snapshot()
     
     def reset_query_stats(self) -> None:
-        """Reset query statistics"""
+        """Reset query statistics - SYNC"""
         self._query_stats.reset()
-        logger.debug("Query statistics reset")
+        logger.debug("SYNC Query statistics reset")
     
-    # ============= Context Managers =============
+    # ============= Context Managers (SYNC) =============
     
     @contextmanager
     def _measure_execution_time(self, operation: str, table_name: str):
         """
-        Context manager to measure query execution time
-        Shared timing logic
+        Context manager to measure query execution time - SYNC
         """
         start_time = time.time()
         status = "success"
