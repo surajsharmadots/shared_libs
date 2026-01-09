@@ -59,67 +59,39 @@ class AsyncDatabaseOperations:
         """
         from sqlalchemy import Table as SA_Table
         
-        # Create empty table initially
-        table = SA_Table(
-            table_name,
-            self.metadata,
-            schema=self.config.schema,
-            extend_existing=True
-        )
-        
         try:
-            # Use async connection to inspect table
             async with self.async_engine.connect() as conn:
-                # Get table inspector
-                inspector = await conn.run_sync(
-                    lambda sync_conn: inspect(sync_conn)
-                )
-                
-                # Get columns from database
-                columns_info = inspector.get_columns(
-                    table_name,
-                    schema=self.config.schema
-                )
-                
-                if not columns_info:
-                    # Table might not exist or has no columns
-                    logger.warning(f"ASYNC: Table {table_name} not found or has no columns")
-                    return table
-                
-                # Get primary keys
-                pk_constraint = inspector.get_pk_constraint(
-                    table_name,
-                    schema=self.config.schema
-                )
-                pk_columns = pk_constraint.get('constrained_columns', [])
-                
-                # Add columns to table
-                for col_info in columns_info:
-                    col_name = col_info['name']
-                    
-                    # Skip if column already exists
-                    if hasattr(table.c, col_name):
-                        continue
-                    
-                    column = Column(
-                        col_name,
-                        col_info['type'],
-                        primary_key=(col_name in pk_columns),
-                        nullable=col_info.get('nullable', True),
-                        default=col_info.get('default'),
-                        server_default=col_info.get('server_default'),
+                # Reflect all tables in schema using run_sync
+                await conn.run_sync(
+                    lambda sync_conn: self.metadata.reflect(
+                        bind=sync_conn,
+                        schema=self.config.schema
                     )
+                )
+                
+                # Table ka full name banaye (schema ke saath)
+                full_table_name = f"{self.config.schema}.{table_name}" if self.config.schema else table_name
+                
+                if full_table_name in self.metadata.tables:
+                    table = self.metadata.tables[full_table_name]
+                    logger.debug(f"ASYNC: Table {table_name} reflected successfully")
+                    return table
+                else:
+                    # Table nahi mila to empty table create karo
+                    logger.warning(f"ASYNC: Table {table_name} not found in metadata")
                     
-                    # Append column to table
-                    table.append_column(column)
-                
-                logger.debug(f"ASYNC: Reflected table {table_name} with {len(columns_info)} columns")
-                
         except Exception as e:
             logger.error(f"ASYNC: Failed to reflect table {table_name}: {e}")
-            # Return minimal table if reflection fails
+            # Log detailed error
+            import traceback
+            logger.error(f"ASYNC: Traceback: {traceback.format_exc()}")
         
-        return table
+        # Fallback: create minimal table
+        return SA_Table(
+            table_name,
+            self.metadata,
+            schema=self.config.schema
+        )
     
     async def get_table_info_async(self, table_name: str) -> Dict[str, Any]:
         """
@@ -252,6 +224,7 @@ class AsyncDatabaseOperations:
         """Clear the table metadata cache - ASYNC"""
         self._table_cache.clear()
         self._reflected_tables.clear()
+        self.metadata.clear()
         logger.debug("ASYNC Table cache cleared")
     
     async def get_cached_tables_async(self) -> List[str]:

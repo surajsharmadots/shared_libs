@@ -103,6 +103,12 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient):
             # Validate data
             self.async_ops._validate_data_async(data, "create")
             
+            # if 'id' in table.c and 'id' not in data:
+            #     id_column = table.c['id']
+            #     # Check if it's UUID column
+            #     if hasattr(id_column.type, '__visit_name__') and id_column.type.__visit_name__ == 'UUID':
+            #         import uuid
+            #         data['id'] = str(uuid.uuid4())
             # Build and execute INSERT
             stmt = insert(table).values(**data)
             if returning:
@@ -407,7 +413,6 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient):
             offset=(page - 1) * per_page,
             order_by=order_by
         )
-        
         # Get items
         items = await self.aread(table_name, conditions, options)
         
@@ -596,6 +601,7 @@ class AsyncPostgresDB(AsyncBaseDatabaseClient):
     async def aclose(self):
         """Close async connection"""
         await self.async_engine.dispose()
+        await self.async_ops.clear_table_cache_async()
         logger.info("Async database connection closed")
     
     # ============= ABSTRACT METHODS IMPLEMENTATION =============
